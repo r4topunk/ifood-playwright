@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 const SESSION = process.env.IFOOD_SESSION || "ifood-sim";
 const OUTPUT_DIR = join(process.cwd(), "output");
 const SAVE_TO_FILE = process.argv.includes("--save");
+const TOON_MODE = process.argv.includes("--toon") || process.argv.includes("--agent");
 const METRICS = { apiCalls: 0, playwrightCalls: 0, startedAt: Date.now() };
 
 const DEFAULT_LAT = "-22.9130192";
@@ -57,9 +58,18 @@ const SEARCH_PAYLOAD = {
   "faster-overrides": ""
 };
 
-function fail(msg) {
-  console.error(msg);
-  process.exit(1);
+class ScriptError extends Error {
+  constructor(message, code = "SCRIPT_ERROR", stage = "unknown", details = null) {
+    super(message);
+    this.name = "ScriptError";
+    this.code = code;
+    this.stage = stage;
+    this.details = details;
+  }
+}
+
+function throwError(message, code = "SCRIPT_ERROR", stage = "unknown", details = null) {
+  throw new ScriptError(message, code, stage, details);
 }
 
 function nowMs() {
@@ -87,7 +97,7 @@ function runPlaywrightCli(args) {
   const out = spawnSync("npx", cmdArgs, { encoding: "utf8" });
   if (out.status !== 0) {
     const detail = [out.stdout, out.stderr].filter(Boolean).join("\n");
-    fail(`Falha no playwright-cli:\n${detail}`);
+    throwError(`Falha no playwright-cli`, "PLAYWRIGHT_CLI_FAILED", "playwright", { detail });
   }
   return out.stdout;
 }
@@ -95,14 +105,14 @@ function runPlaywrightCli(args) {
 function parseResult(stdout) {
   const marker = "### Result";
   const idx = stdout.indexOf(marker);
-  if (idx < 0) fail(`Não consegui ler saída do playwright-cli:\n${stdout}`);
+  if (idx < 0) throwError("Não consegui ler saída do playwright-cli", "PARSE_RESULT_FAILED", "playwright", { stdout });
   const after = stdout.slice(idx + marker.length).trimStart();
   const nextMarker = after.indexOf("\n### ");
   const raw = (nextMarker >= 0 ? after.slice(0, nextMarker) : after).trim();
   try {
     return JSON.parse(raw);
   } catch {
-    fail(`JSON inválido no retorno:\n${raw}`);
+    throwError("JSON inválido no retorno", "INVALID_JSON_RESULT", "playwright", { raw });
   }
 }
 
@@ -147,22 +157,38 @@ function redactSensitive(input) {
   return out;
 }
 
-function emit(prefix, data, summary = null) {
-  const payload = withMetrics(data);
+function toon(payload) {
+  return {
+    ok: Boolean(payload.ok),
+    stage: payload.stage || "unknown",
+    errorCode: payload.errorCode || null,
+    message: payload.message || null,
+    details: payload.details || {},
+    warnings: payload.warnings || [],
+    performance: payload.performance
+  };
+}
+
+function emit(prefix, data) {
+  const enriched = withMetrics({
+    command: prefix,
+    ...data
+  });
+  const redacted = redactSensitive(enriched);
+  const payload = TOON_MODE ? toon(redacted) : redacted;
   const file = maybeSaveJson(prefix, payload);
   if (file) {
-    console.log(`${prefix} salvo em: ${file}`);
-  } else {
-    console.log(JSON.stringify(redactSensitive(payload), null, 2));
+    console.log(JSON.stringify({ ok: true, stage: "io", message: `${prefix} salvo em: ${file}` }, null, 2));
+    return;
   }
-  if (summary) console.log(summary);
+  console.log(JSON.stringify(payload, null, 2));
 }
 
 function getArg(flag, required = true) {
   const idx = process.argv.indexOf(flag);
   const value = idx >= 0 ? process.argv[idx + 1] : undefined;
   if (required && (!value || value.startsWith("--"))) {
-    fail(`Parâmetro obrigatório ausente: ${flag}`);
+    throwError(`Parâmetro obrigatório ausente: ${flag}`, "MISSING_ARG", "args", { flag });
   }
   return value;
 }
@@ -175,6 +201,9 @@ function usage() {
   console.log(
     [
       "Uso:",
+      "  node scripts/ifood-api-session.mjs health-check [--with-api] [--with-ui]",
+      "  node scripts/ifood-api-session.mjs ensure-address [--address \"R. X, 10\"]",
+      "  node scripts/ifood-api-session.mjs checkout-readiness",
       "  node scripts/ifood-api-session.mjs context",
       "  node scripts/ifood-api-session.mjs search-merchants --term \"blue ribbon\" [--lat -22.9130192 --lon -43.2381099]",
       "  node scripts/ifood-api-session.mjs catalog --merchant-id <uuid> [--lat -22.9130192 --lon -43.2381099]",
@@ -182,7 +211,11 @@ function usage() {
       "  node scripts/ifood-api-session.mjs resolve-item --merchant-term \"blue ribbon\" --item-term \"smash bacon duplo\"",
       "  node scripts/ifood-api-session.mjs add-item --merchant-term \"blue ribbon\" --item-term \"smash bacon duplo\"",
       "  node scripts/ifood-api-session.mjs capture-carts [--merchant-id <uuid>] [--item-id <uuid>]",
-      "  (opcional) adicione --save para gravar em output/",
+      "",
+      "Flags globais:",
+      "  --save   grava o JSON em output/",
+      "  --toon   saída compacta para agentes (schema estável)",
+      "  --agent  alias de --toon",
       "",
       "Dica:",
       "  export IFOOD_SESSION=ifood-sim",
@@ -232,6 +265,29 @@ function getSessionContext() {
       pxcts: pick("pxcts")
     };
   }`);
+}
+
+function validateSessionContext(ctx) {
+  const requiredKeys = [
+    "accessToken",
+    "accountId",
+    "appVersion",
+    "appKey",
+    "deviceId",
+    "sessionId",
+    "px3",
+    "pxvid",
+    "pxcts"
+  ];
+  const missing = requiredKeys.filter((key) => !ctx[key]);
+  return {
+    ok: missing.length === 0,
+    missing,
+    checks: {
+      accessTokenLength: ctx.accessToken ? ctx.accessToken.length : 0,
+      accountIdPresent: Boolean(ctx.accountId)
+    }
+  };
 }
 
 function commonHeaders(ctx) {
@@ -317,14 +373,13 @@ function parseMerchantCandidates(searchResponse) {
   return out.filter((m) => m.id && m.name);
 }
 
-function pickMerchant(merchants, query) {
-  const ranked = merchants
+function rankMerchants(merchants, query) {
+  return merchants
     .map((m) => ({
       ...m,
-      score: scoreMatch(query, m.name) + (m.available ? 15 : 0)
+      score: scoreMatch(query, m.name) + (m.available ? 25 : -100)
     }))
     .sort((a, b) => b.score - a.score);
-  return ranked[0] || null;
 }
 
 async function getCatalog(ctx, merchantId, lat = DEFAULT_LAT, lon = DEFAULT_LON) {
@@ -399,55 +454,203 @@ function parseItemDetails(itemResponse) {
 async function resolveItemPlan(ctx, args) {
   const lat = args.lat || DEFAULT_LAT;
   const lon = args.lon || DEFAULT_LON;
+  const attempts = [];
 
-  let merchant = null;
   if (args.merchantId) {
-    merchant = { id: args.merchantId, name: args.merchantTerm || "(id direto)", slug: args.merchantSlug || null };
-  } else {
-    if (!args.merchantTerm) fail("Informe --merchant-term ou --merchant-id");
-    const searchRes = await searchMerchants(ctx, args.merchantTerm, lat, lon);
-    if (!searchRes.ok) fail(`Falha no search-merchants: HTTP ${searchRes.status}`);
-    const merchants = parseMerchantCandidates(searchRes.response);
-    const picked = pickMerchant(merchants, args.merchantTerm);
-    if (!picked) fail(`Nenhum merchant encontrado para: ${args.merchantTerm}`);
-    merchant = picked;
+    const merchant = { id: args.merchantId, name: args.merchantTerm || "(id direto)", slug: args.merchantSlug || null, available: true };
+    const item = await resolveItemForMerchant(ctx, merchant, args, lat, lon, attempts);
+    return {
+      merchant,
+      item,
+      attempts,
+      coords: { lat, lon }
+    };
   }
 
-  let item = null;
-  if (args.itemId) {
-    const detailRes = await getItemDetails(ctx, merchant.id, args.itemId);
-    if (!detailRes.ok) fail(`Falha no item details: HTTP ${detailRes.status}`);
-    const parsed = parseItemDetails(detailRes.response);
-    if (!parsed) fail("Item não encontrado no payload de detalhes");
-    item = parsed;
-  } else {
-    if (!args.itemTerm) fail("Informe --item-term ou --item-id");
-    const catalogRes = await getCatalog(ctx, merchant.id, lat, lon);
-    if (!catalogRes.ok) fail(`Falha no catalog: HTTP ${catalogRes.status}`);
-    const items = parseCatalogItems(catalogRes.response);
-    const pickedItem = pickItem(items, args.itemTerm);
-    if (!pickedItem) fail(`Nenhum item encontrado para: ${args.itemTerm}`);
-
-    const detailRes = await getItemDetails(ctx, merchant.id, pickedItem.id);
-    if (!detailRes.ok) fail(`Falha no item details: HTTP ${detailRes.status}`);
-    const parsed = parseItemDetails(detailRes.response);
-    if (!parsed) fail("Item encontrado no catálogo, mas não retornou em details");
-    item = parsed;
+  if (!args.merchantTerm) {
+    throwError("Informe --merchant-term ou --merchant-id", "MISSING_MERCHANT", "resolve-item");
   }
 
-  return {
-    merchant: {
-      id: merchant.id,
-      name: merchant.name,
-      slug: merchant.slug || null,
-      available: merchant.available ?? true
-    },
-    item,
-    coords: { lat, lon }
-  };
+  const searchRes = await searchMerchants(ctx, args.merchantTerm, lat, lon);
+  if (!searchRes.ok) {
+    throwError(`Falha no search-merchants: HTTP ${searchRes.status}`, "SEARCH_FAILED", "resolve-item", { status: searchRes.status });
+  }
+
+  const ranked = rankMerchants(parseMerchantCandidates(searchRes.response), args.merchantTerm);
+  if (!ranked.length) {
+    throwError(`Nenhum merchant encontrado para: ${args.merchantTerm}`, "MERCHANT_NOT_FOUND", "resolve-item");
+  }
+
+  for (const merchant of ranked) {
+    try {
+      const item = await resolveItemForMerchant(ctx, merchant, args, lat, lon, attempts);
+      return {
+        merchant: {
+          id: merchant.id,
+          name: merchant.name,
+          slug: merchant.slug || null,
+          available: merchant.available
+        },
+        item,
+        attempts,
+        coords: { lat, lon }
+      };
+    } catch (error) {
+      attempts.push({
+        merchantId: merchant.id,
+        merchantName: merchant.name,
+        available: merchant.available,
+        ok: false,
+        reason: error.message
+      });
+    }
+  }
+
+  throwError("Nenhum merchant elegível conseguiu resolver o item", "MERCHANT_FALLBACK_EXHAUSTED", "resolve-item", { attempts });
 }
 
-async function uiAddItem(plan) {
+async function resolveItemForMerchant(ctx, merchant, args, lat, lon, attempts) {
+  if (args.itemId) {
+    const detailRes = await getItemDetails(ctx, merchant.id, args.itemId);
+    if (!detailRes.ok) {
+      throwError(`Falha no item details: HTTP ${detailRes.status}`, "ITEM_DETAILS_FAILED", "resolve-item", { status: detailRes.status });
+    }
+    const parsed = parseItemDetails(detailRes.response);
+    if (!parsed) {
+      throwError("Item não encontrado no payload de detalhes", "ITEM_NOT_IN_DETAILS", "resolve-item");
+    }
+    attempts.push({
+      merchantId: merchant.id,
+      merchantName: merchant.name,
+      available: merchant.available,
+      ok: true,
+      reason: "item-id resolvido"
+    });
+    return parsed;
+  }
+
+  if (!args.itemTerm) {
+    throwError("Informe --item-term ou --item-id", "MISSING_ITEM", "resolve-item");
+  }
+
+  const catalogRes = await getCatalog(ctx, merchant.id, lat, lon);
+  if (!catalogRes.ok) {
+    throwError(`Falha no catalog: HTTP ${catalogRes.status}`, "CATALOG_FAILED", "resolve-item", { status: catalogRes.status });
+  }
+
+  const items = parseCatalogItems(catalogRes.response);
+  const pickedItem = pickItem(items, args.itemTerm);
+  if (!pickedItem) {
+    throwError(`Nenhum item encontrado para: ${args.itemTerm}`, "ITEM_NOT_FOUND", "resolve-item");
+  }
+
+  const detailRes = await getItemDetails(ctx, merchant.id, pickedItem.id);
+  if (!detailRes.ok) {
+    throwError(`Falha no item details: HTTP ${detailRes.status}`, "ITEM_DETAILS_FAILED", "resolve-item", { status: detailRes.status });
+  }
+
+  const parsed = parseItemDetails(detailRes.response);
+  if (!parsed) {
+    throwError("Item encontrado no catálogo, mas não retornou em details", "ITEM_NOT_IN_DETAILS", "resolve-item");
+  }
+
+  attempts.push({
+    merchantId: merchant.id,
+    merchantName: merchant.name,
+    available: merchant.available,
+    ok: true,
+    reason: "item-term resolvido"
+  });
+  return parsed;
+}
+
+function isAntiBot(uiResult) {
+  return Boolean(uiResult?.antiBot);
+}
+
+async function uiEnsureAddress(addressQuery = null) {
+  const escapedAddress = JSON.stringify(addressQuery || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\$/g, "\\$");
+
+  return pwEvalJson(`async (page) => {
+    const query = JSON.parse(\`${escapedAddress}\`);
+    const antiBotPattern = /(press\s*&\s*hold|verifique que voce e humano|cloudflare)/i;
+
+    const antiBot = async () => {
+      const text = await page.locator('body').innerText().catch(() => '');
+      return antiBotPattern.test(text || '');
+    };
+
+    await page.goto('https://www.ifood.com.br', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.waitForTimeout(1200);
+
+    if (await antiBot()) {
+      return { ok: false, antiBot: true, message: 'Challenge anti-bot detectado.' };
+    }
+
+    const readAddress = async () => {
+      const candidates = [
+        page.getByRole('button', { name: /escolha um endereco/i }).first(),
+        page.getByRole('button', { name: /buscar endereco e numero/i }).first(),
+        page.getByRole('button', { name: /endereco de entrega/i }).first()
+      ];
+      for (const c of candidates) {
+        try {
+          if (await c.isVisible({ timeout: 500 })) {
+            const txt = await c.innerText().catch(() => null);
+            if (txt) return txt.trim();
+          }
+        } catch {}
+      }
+      return null;
+    };
+
+    const before = await readAddress();
+
+    if (query) {
+      const opener = page.getByRole('button', { name: /escolha um endereco|buscar endereco e numero/i }).first();
+      if (await opener.isVisible({ timeout: 2500 }).catch(() => false)) {
+        await opener.click({ timeout: 3000 }).catch(() => {});
+      }
+
+      const input = page.getByRole('textbox', { name: /endereco de entrega e numero|buscar endereco/i }).first();
+      if (await input.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await input.fill(query).catch(() => {});
+        await input.press('Enter').catch(() => {});
+        await page.waitForTimeout(1500);
+      }
+
+      const resultOption = page.getByText(query.split(',')[0], { exact: false }).first();
+      if (await resultOption.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await resultOption.click({ timeout: 3000 }).catch(() => {});
+      }
+
+      const saveBtn = page.getByRole('button', { name: /salvar endereco/i }).first();
+      if (await saveBtn.isVisible({ timeout: 2500 }).catch(() => false)) {
+        await saveBtn.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(1200);
+      }
+    }
+
+    const after = await readAddress();
+    const hasAddress = Boolean(after && !/escolha um endereco|buscar endereco e numero/i.test(after));
+    const matchesQuery = query ? (after || '').toLowerCase().includes(query.split(',')[0].toLowerCase()) : null;
+
+    return {
+      ok: hasAddress && (query ? Boolean(matchesQuery) : true),
+      antiBot: false,
+      before,
+      after,
+      hasAddress,
+      matchesQuery,
+      currentUrl: page.url()
+    };
+  }`);
+}
+
+async function uiAddAndValidateCart(plan) {
   const escapedPlan = JSON.stringify(plan)
     .replace(/\\/g, "\\\\")
     .replace(/`/g, "\\`")
@@ -458,8 +661,13 @@ async function uiAddItem(plan) {
     const merchantId = plan.merchant.id;
     const itemId = plan.item.id;
     const slug = plan.merchant.slug;
-
     const itemName = plan.item.description || "";
+
+    const antiBotPattern = /(press\s*&\s*hold|verifique que voce e humano|cloudflare)/i;
+    const antiBot = async () => {
+      const text = await page.locator('body').innerText().catch(() => '');
+      return antiBotPattern.test(text || '');
+    };
 
     const candidates = [];
     if (slug) candidates.push('https://www.ifood.com.br/delivery/' + slug + '/' + merchantId + '?prato=' + itemId);
@@ -473,9 +681,15 @@ async function uiAddItem(plan) {
         break;
       } catch {}
     }
-    if (!loaded) throw new Error('Não consegui abrir página do item');
+    if (!loaded) {
+      return { ok: false, errorCode: 'ITEM_PAGE_UNAVAILABLE', antiBot: false, message: 'Não consegui abrir página do item.' };
+    }
 
     await page.waitForTimeout(1500);
+
+    if (await antiBot()) {
+      return { ok: false, antiBot: true, errorCode: 'ANTI_BOT_CHALLENGE', message: 'Challenge anti-bot detectado.' };
+    }
 
     for (const sub of plan.item.subItems || []) {
       try {
@@ -487,6 +701,10 @@ async function uiAddItem(plan) {
     }
 
     const addBtn = page.locator('[data-test-id="dish-action__add-button"]');
+    if (!await addBtn.isVisible({ timeout: 6000 }).catch(() => false)) {
+      return { ok: false, antiBot: false, errorCode: 'ADD_BUTTON_NOT_FOUND', message: 'Botão de adicionar não encontrado.' };
+    }
+
     await addBtn.click({ timeout: 8000 });
     await page.waitForTimeout(1200);
 
@@ -496,17 +714,145 @@ async function uiAddItem(plan) {
       await page.waitForTimeout(1200);
     }
 
-    const cartText = page.locator('text=' + itemName).first();
-    const itemAppears = await cartText.isVisible({ timeout: 3000 }).catch(() => false);
+    const openCartBtn = page.locator('[data-test-id="header-cart"]').first();
+    if (await openCartBtn.isVisible({ timeout: 2500 }).catch(() => false)) {
+      await openCartBtn.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+    }
+
+    const itemVisible = await page.getByText(itemName, { exact: false }).first().isVisible({ timeout: 3500 }).catch(() => false);
+    const quantityVisible = await page.getByText('1x', { exact: false }).first().isVisible({ timeout: 1000 }).catch(() => false);
+
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    const moneyMatches = (bodyText.match(/R\$\s?\d+[\.,]\d{2}/g) || []).slice(0, 5);
 
     return {
-      ok: itemAppears,
+      ok: itemVisible,
+      antiBot: false,
       loadedUrl: loaded,
       currentUrl: page.url(),
       itemName,
-      message: itemAppears ? 'Item visível no carrinho/painel.' : 'Item não confirmado visualmente; valide no carrinho.'
+      message: itemVisible ? 'Item adicionado e visível no carrinho.' : 'Item não confirmado no carrinho.',
+      cart: {
+        itemVisible,
+        quantityVisible,
+        currencyHints: moneyMatches
+      }
     };
   }`);
+}
+
+async function uiCheckoutReadiness() {
+  return pwEvalJson(`async (page) => {
+    const antiBotPattern = /(press\s*&\s*hold|verifique que voce e humano|cloudflare)/i;
+    const antiBot = async () => {
+      const text = await page.locator('body').innerText().catch(() => '');
+      return antiBotPattern.test(text || '');
+    };
+
+    if (await antiBot()) {
+      return { ok: false, antiBot: true, errorCode: 'ANTI_BOT_CHALLENGE', message: 'Challenge anti-bot detectado.' };
+    }
+
+    const cartBtn = page.locator('[data-test-id="header-cart"]').first();
+    if (await cartBtn.isVisible({ timeout: 2500 }).catch(() => false)) {
+      await cartBtn.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+    }
+
+    const paymentSelect = page.locator('[data-test-id="payment-info-select-method-button"]').first();
+    const paymentOpen = await paymentSelect.isVisible({ timeout: 2500 }).catch(() => false);
+    if (paymentOpen) {
+      await paymentSelect.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+
+    const pix = page.getByText('Pix', { exact: false }).first();
+    const pixVisible = await pix.isVisible({ timeout: 2500 }).catch(() => false);
+    if (pixVisible) {
+      await pix.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+
+    const orderBtn = page.getByRole('button', { name: /fazer pedido/i }).first();
+    const orderVisible = await orderBtn.isVisible({ timeout: 3500 }).catch(() => false);
+    const orderEnabled = orderVisible ? await orderBtn.isEnabled().catch(() => false) : false;
+
+    return {
+      ok: orderVisible && orderEnabled,
+      antiBot: false,
+      paymentSelectorVisible: paymentOpen,
+      pixVisible,
+      orderButtonVisible: orderVisible,
+      orderButtonEnabled: orderEnabled,
+      stopPoint: 'Não clicado em Fazer pedido',
+      currentUrl: page.url()
+    };
+  }`);
+}
+
+async function runHealthCheck(ctx, withApi, withUi) {
+  const session = validateSessionContext(ctx);
+  if (!session.ok) {
+    throwError("Sessão incompleta. Refaça login no iFood.", "SESSION_INCOMPLETE", "health-check", { missing: session.missing });
+  }
+
+  let api = null;
+  if (withApi) {
+    const probe = await searchMerchants(ctx, "pizza", DEFAULT_LAT, DEFAULT_LON);
+    api = {
+      ok: probe.ok,
+      status: probe.status,
+      sampleMerchants: parseMerchantCandidates(probe.response).slice(0, 3).map((m) => ({ id: m.id, name: m.name, available: m.available }))
+    };
+    if (!probe.ok) {
+      throwError(`Falha no probe de API: HTTP ${probe.status}`, "API_PROBE_FAILED", "health-check", { status: probe.status });
+    }
+  }
+
+  let ui = null;
+  if (withUi) {
+    ui = await uiEnsureAddress(null);
+    if (isAntiBot(ui)) {
+      throwError("Challenge anti-bot detectado. Resolva manualmente e rode novamente.", "ANTI_BOT_CHALLENGE", "health-check", ui);
+    }
+  }
+
+  const overallOk =
+    session.ok &&
+    (!withApi || Boolean(api?.ok)) &&
+    (!withUi || Boolean(ui?.ok));
+  const warnings = [];
+  if (withUi && !ui?.ok) {
+    warnings.push("Endereço de entrega não confirmado na UI.");
+  }
+
+  return {
+    ok: overallOk,
+    stage: "health-check",
+    errorCode: overallOk ? null : "HEALTH_CHECK_PARTIAL",
+    message: overallOk ? "Health-check concluído" : "Health-check com pendências",
+    warnings,
+    details: {
+      session,
+      api,
+      ui,
+      sessionId: SESSION
+    }
+  };
+}
+
+function shouldLoadContext(command) {
+  const contextCommands = new Set([
+    "context",
+    "health-check",
+    "search-merchants",
+    "catalog",
+    "item",
+    "resolve-item",
+    "add-item"
+  ]);
+  return contextCommands.has(command);
 }
 
 async function main() {
@@ -521,16 +867,50 @@ async function main() {
     return;
   }
 
-  const ctx = getSessionContext();
-  if (!ctx.accessToken) fail("Sessão sem aAccessToken. Refaça login no iFood.");
+  const ctx = shouldLoadContext(command) ? getSessionContext() : null;
 
   if (command === "context") {
+    const validation = validateSessionContext(ctx);
     const redacted = {
       ...ctx,
-      accessToken: `${ctx.accessToken.slice(0, 24)}...`,
+      accessToken: ctx.accessToken ? `${ctx.accessToken.slice(0, 24)}...` : null,
       px3: ctx.px3 ? `${ctx.px3.slice(0, 16)}...` : null
     };
-    emit("context", redacted);
+    emit("context", {
+      ok: validation.ok,
+      stage: "context",
+      errorCode: validation.ok ? null : "SESSION_INCOMPLETE",
+      message: validation.ok ? "Contexto de sessão válido" : "Contexto de sessão incompleto",
+      details: { context: redacted, validation }
+    });
+    return;
+  }
+
+  if (shouldLoadContext(command) && !ctx?.accessToken) {
+    throwError("Sessão sem aAccessToken. Refaça login no iFood.", "SESSION_MISSING", "bootstrap");
+  }
+
+  if (command === "health-check") {
+    const result = await runHealthCheck(ctx, hasFlag("--with-api") || !hasFlag("--no-api"), hasFlag("--with-ui") || !hasFlag("--no-ui"));
+    emit("health-check", result);
+    return;
+  }
+
+  if (command === "ensure-address") {
+    const address = getArg("--address", false);
+    const ui = await uiEnsureAddress(address || null);
+    if (isAntiBot(ui)) {
+      throwError("Challenge anti-bot detectado. Resolva manualmente e rode novamente.", "ANTI_BOT_CHALLENGE", "ensure-address", ui);
+    }
+    if (!ui.ok) {
+      throwError("Endereço não confirmado", "ADDRESS_NOT_CONFIRMED", "ensure-address", ui);
+    }
+    emit("ensure-address", {
+      ok: true,
+      stage: "ensure-address",
+      message: "Endereço confirmado",
+      details: ui
+    });
     return;
   }
 
@@ -539,7 +919,13 @@ async function main() {
     const lat = getArg("--lat", false) ?? DEFAULT_LAT;
     const lon = getArg("--lon", false) ?? DEFAULT_LON;
     const result = await searchMerchants(ctx, term, lat, lon);
-    emit("search-merchants", result, `status: ${result.status}`);
+    emit("search-merchants", {
+      ok: result.ok,
+      stage: "search-merchants",
+      errorCode: result.ok ? null : "SEARCH_FAILED",
+      message: `status: ${result.status}`,
+      details: result
+    });
     return;
   }
 
@@ -548,7 +934,13 @@ async function main() {
     const lat = getArg("--lat", false) ?? DEFAULT_LAT;
     const lon = getArg("--lon", false) ?? DEFAULT_LON;
     const result = await getCatalog(ctx, merchantId, lat, lon);
-    emit("catalog", result, `status: ${result.status}`);
+    emit("catalog", {
+      ok: result.ok,
+      stage: "catalog",
+      errorCode: result.ok ? null : "CATALOG_FAILED",
+      message: `status: ${result.status}`,
+      details: result
+    });
     return;
   }
 
@@ -556,7 +948,13 @@ async function main() {
     const merchantId = getArg("--merchant-id");
     const itemId = getArg("--item-id");
     const result = await getItemDetails(ctx, merchantId, itemId);
-    emit("item", result, `status: ${result.status}`);
+    emit("item", {
+      ok: result.ok,
+      stage: "item",
+      errorCode: result.ok ? null : "ITEM_DETAILS_FAILED",
+      message: `status: ${result.status}`,
+      details: result
+    });
     return;
   }
 
@@ -570,7 +968,12 @@ async function main() {
       lat: getArg("--lat", false),
       lon: getArg("--lon", false)
     });
-    emit("resolve-item", { ok: true, plan }, "resolve-item concluído");
+    emit("resolve-item", {
+      ok: true,
+      stage: "resolve-item",
+      message: "resolve-item concluído",
+      details: { plan }
+    });
     return;
   }
 
@@ -587,21 +990,52 @@ async function main() {
     });
 
     if (dryRun) {
-      emit("add-item", { ok: true, mode: "dry-run", plan }, "dry-run: nada foi adicionado");
+      emit("add-item", {
+        ok: true,
+        stage: "add-item",
+        message: "dry-run: nada foi adicionado",
+        details: { mode: "dry-run", plan }
+      });
       return;
     }
 
-    const ui = await uiAddItem(plan);
-    emit("add-item", { ok: ui.ok, mode: "execute", plan, ui }, ui.message);
+    const ui = await uiAddAndValidateCart(plan);
+    if (isAntiBot(ui)) {
+      throwError("Challenge anti-bot detectado. Resolva manualmente e rode novamente.", "ANTI_BOT_CHALLENGE", "add-item", ui);
+    }
+    const ok = Boolean(ui.ok);
+    emit("add-item", {
+      ok,
+      stage: "add-item",
+      errorCode: ok ? null : "CART_VALIDATION_FAILED",
+      message: ok ? "Item adicionado e carrinho validado" : "Item adicionado, mas validação do carrinho falhou",
+      details: {
+        mode: "execute",
+        plan,
+        ui
+      }
+    });
+    return;
+  }
+
+  if (command === "checkout-readiness") {
+    const ui = await uiCheckoutReadiness();
+    if (isAntiBot(ui)) {
+      throwError("Challenge anti-bot detectado. Resolva manualmente e rode novamente.", "ANTI_BOT_CHALLENGE", "checkout-readiness", ui);
+    }
+    emit("checkout-readiness", {
+      ok: ui.ok,
+      stage: "checkout-readiness",
+      errorCode: ui.ok ? null : "CHECKOUT_NOT_READY",
+      message: ui.ok ? "Checkout pronto até o ponto seguro" : "Checkout ainda não está pronto",
+      details: ui
+    });
     return;
   }
 
   if (command === "capture-carts") {
-    const merchantId =
-      getArg("--merchant-id", false) ??
-      "621d98e9-cd75-44d4-8124-1dbbb3f2a750";
-    const itemId =
-      getArg("--item-id", false) ?? "b04b11cd-3275-42b9-8a4f-660985a06806";
+    const merchantId = getArg("--merchant-id", false) ?? "621d98e9-cd75-44d4-8124-1dbbb3f2a750";
+    const itemId = getArg("--item-id", false) ?? "b04b11cd-3275-42b9-8a4f-660985a06806";
 
     const payload = pwEvalJson(`async (page) => {
       const client = await page.context().newCDPSession(page);
@@ -630,7 +1064,12 @@ async function main() {
       return { hits };
     }`);
 
-    emit("capture-carts", payload, `hits capturados: ${payload.hits?.length ?? 0}`);
+    emit("capture-carts", {
+      ok: true,
+      stage: "capture-carts",
+      message: `hits capturados: ${payload.hits?.length ?? 0}`,
+      details: payload
+    });
     return;
   }
 
@@ -638,4 +1077,15 @@ async function main() {
   process.exit(1);
 }
 
-main().catch((err) => fail(`Erro: ${err?.stack || err}`));
+main().catch((err) => {
+  const known = err instanceof ScriptError;
+  const payload = {
+    ok: false,
+    stage: known ? err.stage : "unknown",
+    errorCode: known ? err.code : "UNHANDLED_ERROR",
+    message: err?.message || String(err),
+    details: known ? err.details : { stack: err?.stack || null }
+  };
+  emit("error", payload);
+  process.exit(1);
+});
